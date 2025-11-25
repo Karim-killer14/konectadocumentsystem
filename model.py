@@ -49,60 +49,93 @@ class LayoutLMInferencer:
     # MAIN INFERENCE
     # ----------------------------------------------------------------------
     def infer(self, input_data, task="key_value"):
+    """
+    Accepts:
+    - PIL.Image.Image
+    - Uploaded file
+    - Bytes
+    """
+
+    # ---------------------------------------------------------
+    # CASE 1 — Already a PIL Image → use directly
+    # ---------------------------------------------------------
+    if isinstance(input_data, Image.Image):
+        image = input_data
+
+    # ---------------------------------------------------------
+    # CASE 2 — UploadedFile from Streamlit
+    # ---------------------------------------------------------
+    elif hasattr(input_data, "read"):
+        image = self.load_image(input_data)
+
+    # ---------------------------------------------------------
+    # CASE 3 — Raw bytes (PDF or image)
+    # ---------------------------------------------------------
+    elif isinstance(input_data, (bytes, bytearray)):
+        image = self.load_image(input_data)
+
+    else:
+        raise ValueError(f"infer() received unsupported input type: {type(input_data)}")
+
+    # ---------------------------------------------------------
+    # RUN LAYOUTLM PROCESSOR (no boxes, no words)
+    # ---------------------------------------------------------
+    enc = self.processor(
+        image,
+        padding="max_length",
+        return_tensors="pt"
+    )
+
+    enc = {k: v.to(self.device) for k, v in enc.items()}
+
+    with torch.no_grad():
+        outputs = self.model(**enc)
+
+    logits = outputs.logits
+    predictions = torch.argmax(logits, dim=-1).squeeze().cpu().tolist()
+    tokens = self.processor.tokenizer.convert_ids_to_tokens(
+        enc["input_ids"].squeeze()
+    )
+
+    results = []
+    for token, pred in zip(tokens, predictions):
+        if token not in ["[PAD]", "[UNK]", "[CLS]", "[SEP]"]:
+            results.append({"token": token, "label_id": pred})
+
+    return results
+
+
+    def load_image(self, file_obj):
         """
-        Accepts either:
-        - PIL Image
-        - Uploaded file (pdf, jpg, png)
+        Converts PDFs or images into a PIL Image safely
+        Accepts:
+        - Streamlit UploadedFile
+        - bytes
         """
-        # If PIL Image is passed → use directly
-        if isinstance(input_data, Image.Image):
-            image = input_data
+    
+        # ---------------------------------------------------------
+        # GET BYTES SAFELY
+        # ---------------------------------------------------------
+        if hasattr(file_obj, "read"):     # Streamlit UploadedFile
+            file_bytes = file_obj.read()
+            filename = file_obj.name
+        elif isinstance(file_obj, (bytes, bytearray)):
+            file_bytes = file_obj
+            filename = ""  # unknown
         else:
-            image = self.load_image(input_data)
+            raise ValueError("load_image() received invalid input type.")
     
-        # run LayoutLM processor (no boxes, no words)
-        enc = self.processor(
-            image,
-            padding="max_length",
-            return_tensors="pt"
-        )
-    
-        enc = {k: v.to(self.device) for k, v in enc.items()}
-    
-        with torch.no_grad():
-            outputs = self.model(**enc)
-    
-        logits = outputs.logits
-        predictions = torch.argmax(logits, dim=-1).squeeze().cpu().tolist()
-    
-        tokens = self.processor.tokenizer.convert_ids_to_tokens(
-            enc["input_ids"].squeeze()
-        )
-    
-        results = []
-        for token, pred in zip(tokens, predictions):
-            if token not in ["[PAD]", "[UNK]", "[CLS]", "[SEP]"]:
-                results.append({"token": token, "label_id": pred})
-    
-        return results
-    
-    
-    def load_image(self, uploaded_file):
-        """
-        Support uploading PDFs or raw bytes.
-        """
-        if isinstance(uploaded_file, bytes):
-            file_bytes = uploaded_file
-        else:
-            file_bytes = uploaded_file.read()
-    
-        # PDF?
-        if hasattr(uploaded_file, "name") and uploaded_file.name.lower().endswith(".pdf"):
+        # ---------------------------------------------------------
+        # PDF → convert first page to image
+        # ---------------------------------------------------------
+        if filename.lower().endswith(".pdf"):
             import pymupdf as fitz
             pdf = fitz.open(stream=file_bytes, filetype="pdf")
             page = pdf.load_page(0)
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
     
-        # Image?
+        # ---------------------------------------------------------
+        # IMAGE → load normally
+        # ---------------------------------------------------------
         return Image.open(io.BytesIO(file_bytes)).convert("RGB")
