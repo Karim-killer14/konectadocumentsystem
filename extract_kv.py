@@ -1,4 +1,13 @@
-# extract_kv.py
+# kv_extractor_final.py
+"""
+Key-Value Extractor (final)
+Uses LayoutLM token output + fallback OCR + heuristics to extract
+invoice / PO / approval fields and compute per-field confidence.
+"""
+
+from collections import defaultdict
+import re
+import logging
 from utils_v2 import (
     auto_deskew_and_enhance,
     ocr_text_full,
@@ -10,133 +19,223 @@ from utils_v2 import (
     guess_department,
     clean_token_text
 )
-import re
-import logging
 
 logger = logging.getLogger(__name__)
 
+# Document schema we target
+REQUIRED_FIELDS = {
+    "invoice": ["document_id", "date", "amount", "currency"],
+    "purchase_order": ["document_id", "date", "amount", "currency"],
+    "approval": ["document_id", "date", "amount", "currency", "approver", "status"]
+}
+
+# helper to join tokens into readable blob
 def tokens_to_text(tokens_list):
-    # join tokens after cleaning tokens from LayoutLM
     toks = [clean_token_text(t.get("token","")) for t in tokens_list]
     toks = [t for t in toks if t]
     return " ".join(toks)
 
-class KeyValueExtractor:
-    def __init__(self, layoutlm_inferencer, image_preprocess=True):
-        self.model = layoutlm_inferencer
-        self.preprocess = image_preprocess
+# small utility: pick best non-empty value
+def pick_first_nonempty(values):
+    for v in values:
+        if v:
+            return v
+    return None
+
+class FinalKVExtractor:
+    def __init__(self, inferencer, preprocess=True, tesseract_allowed=True):
+        """
+        inferencer: LayoutLMInferencer instance
+        preprocess: run auto enhancement (deskew/denoise)
+        tesseract_allowed: if False, skip OCR fallback (useful when tesseract not installed)
+        """
+        self.model = inferencer
+        self.preprocess = preprocess
+        self.tesseract_allowed = tesseract_allowed
+
+    def _initial_tokens_blob(self, image):
+        try:
+            tokens = self.model.infer(image)
+            text_blob = tokens_to_text(tokens)
+        except Exception as e:
+            logger.exception("LayoutLM inference failed: %s", e)
+            tokens = []
+            text_blob = ""
+        return tokens, text_blob
+
+    def _fallback_ocr(self, image):
+        if not self.tesseract_allowed:
+            return ""
+        try:
+            txt = ocr_text_full(image)
+            return txt or ""
+        except Exception as e:
+            logger.warning("Tesseract OCR failed: %s", e)
+            return ""
+
+    def _classify_doc_type(self, text_blob):
+        tb = (text_blob or "").lower()
+        if re.search(r'\binvoice\b|\binv\b', tb):
+            return "invoice"
+        if re.search(r'\bpurchase order\b|\bpo\b', tb):
+            return "purchase_order"
+        if re.search(r'\bapproval\b|\bapprov\b|\brequest id\b', tb):
+            return "approval"
+        # fallback heuristics
+        if "approver" in tb or "requested by" in tb:
+            return "approval"
+        return "invoice"  # default conservative
 
     def extract_from_image(self, pil_image):
+        """
+        Full pipeline for a single page image.
+        Returns: {
+            fields: {k: v},
+            confidence: {k: score},
+            issues: [messages],
+            raw_texts: { "layoutlm": "...", "ocr": "..." },
+            doc_type: one of ('invoice','purchase_order','approval')
+        }
+        """
         img = pil_image
         if self.preprocess:
             img = auto_deskew_and_enhance(img)
 
-        # run LayoutLM for tokens
-        try:
-            tokens = self.model.infer(img)
-        except Exception as e:
-            logger.exception("LayoutLM inference failed, falling back to OCR-only.")
-            tokens = []
+        tokens, layout_text = self._initial_tokens_blob(img)
+        ocr_text = ""
+        fields = {}
+        conf = {}
+        issues = []
 
-        text_blob = tokens_to_text(tokens)
+        # classify doc type early (affects required fields)
+        doc_type = self._classify_doc_type(layout_text)
 
-        kv = {}
-        confidence = {}
-
-        # document id (invoice/po/approval)
-        docid = extract_invoice_id(text_blob)
-        if docid:
-            kv["document_id"] = docid
-            confidence["document_id"] = 0.9
+        # 1) try to extract from LayoutLM text first
+        # document id
+        did = extract_invoice_id(layout_text)
+        if did:
+            fields["document_id"] = did
+            conf["document_id"] = 0.88
 
         # date
-        dt = extract_date_from_text(text_blob)
+        dt = extract_date_from_text(layout_text)
         if dt:
-            kv["date"] = dt
-            confidence["date"] = 0.85
+            fields["date"] = dt
+            conf["date"] = 0.85
 
         # amount & currency
-        amt = extract_amount_from_text(text_blob)
+        amt = extract_amount_from_text(layout_text)
         if amt is not None:
-            kv["amount"] = round(float(amt), 2)
-            curr = extract_currency_from_text(text_blob)
-            if curr:
-                kv["currency"] = curr
-            confidence["amount"] = 0.8
+            fields["amount"] = round(float(amt), 2)
+            cur = extract_currency_from_text(layout_text)
+            if cur:
+                fields["currency"] = cur
+            conf["amount"] = 0.82
 
         # vendor
-        vendor = guess_vendor_from_text(text_blob)
-        if vendor:
-            kv["vendor"] = vendor
-            confidence["vendor"] = 0.7
+        v = guess_vendor_from_text(layout_text)
+        if v:
+            fields["vendor"] = v
+            conf["vendor"] = 0.7
 
         # department
-        dept = guess_department(text_blob)
-        if dept:
-            kv["department"] = dept
-            confidence["department"] = 0.7
+        d = guess_department(layout_text)
+        if d:
+            fields["department"] = d
+            conf["department"] = 0.7
 
-        # purpose
-        m_purpose = re.search(r'Purpose[:\s\-]+(.{3,120}?)(?:Approver|Status|$)', text_blob, re.IGNORECASE)
+        # purpose/approver/status
+        m_purpose = re.search(r'Purpose[:\s\-]+(.{3,160}?)(?:Approver|Status|$)', layout_text, re.IGNORECASE)
         if m_purpose:
-            kv["purpose"] = m_purpose.group(1).strip()
-            confidence["purpose"] = 0.6
+            p = m_purpose.group(1).strip()
+            fields["purpose"] = p
+            conf["purpose"] = 0.6
 
-        # approver & status
-        m_approver = re.search(r'Approver[:\s\-]*([A-Z][A-Za-z\s]{2,60})', text_blob, re.IGNORECASE)
+        m_approver = re.search(r'Approver[:\s\-]*([A-Z][A-Za-z\s,]{2,80})', layout_text, re.IGNORECASE)
         if m_approver:
-            kv["approver"] = m_approver.group(1).strip()
-            confidence["approver"] = 0.6
+            fields["approver"] = m_approver.group(1).strip()
+            conf["approver"] = 0.65
 
-        m_status = re.search(r'\b(Status)[:\s\-]*(Approved|Pending|Rejected)\b', text_blob, re.IGNORECASE)
+        m_status = re.search(r'\bStatus[:\s\-]*(Approved|Pending|Rejected)\b', layout_text, re.IGNORECASE)
         if m_status:
-            kv["status"] = m_status.group(2).strip()
-            confidence["status"] = 0.8
+            fields["status"] = m_status.group(1).strip()
+            conf["status"] = 0.8
 
-        # Fallback: if critical fields missing, run full Tesseract OCR and try again
-        critical_missing = [k for k in ["amount","date","document_id","vendor"] if k not in kv]
-        if critical_missing:
-            ocr_txt = ocr_text_full(img)
-            if not ocr_txt:
-                logger.warning("Tesseract OCR returned empty. Tesseract may not be installed.")
-            else:
-                if "amount" in critical_missing:
-                    amt2 = extract_amount_from_text(ocr_txt)
-                    if amt2 is not None:
-                        kv["amount"] = round(float(amt2),2)
-                        confidence["amount"] = 0.6
-                        curr2 = extract_currency_from_text(ocr_txt)
-                        if curr2: kv["currency"] = curr2
-                if "date" in critical_missing:
-                    dt2 = extract_date_from_text(ocr_txt)
-                    if dt2:
-                        kv["date"] = dt2
-                        confidence["date"] = 0.6
-                if "vendor" in critical_missing:
-                    v2 = guess_vendor_from_text(ocr_txt)
-                    if v2:
-                        kv["vendor"] = v2
-                        confidence["vendor"] = 0.5
-                if "document_id" in critical_missing:
-                    id2 = extract_invoice_id(ocr_txt)
-                    if id2:
-                        kv["document_id"] = id2
-                        confidence["document_id"] = 0.6
+        # 2) detect missing critical fields and run OCR fallback if allowed
+        needed = REQUIRED_FIELDS.get(doc_type, [])
+        missing = [k for k in needed if k not in fields]
+        if missing and self.tesseract_allowed:
+            ocr_text = self._fallback_ocr(img)
+            # re-check missing
+            if "document_id" in missing and "document_id" not in fields:
+                did2 = extract_invoice_id(ocr_text)
+                if did2:
+                    fields["document_id"] = did2
+                    conf["document_id"] = 0.6
+            if "date" in missing and "date" not in fields:
+                dt2 = extract_date_from_text(ocr_text)
+                if dt2:
+                    fields["date"] = dt2
+                    conf["date"] = 0.6
+            if "amount" in missing and "amount" not in fields:
+                amt2 = extract_amount_from_text(ocr_text)
+                if amt2 is not None:
+                    fields["amount"] = round(float(amt2),2)
+                    c2 = extract_currency_from_text(ocr_text)
+                    if c2: fields["currency"] = c2
+                    conf["amount"] = 0.6
+            if "vendor" in missing and "vendor" not in fields:
+                v2 = guess_vendor_from_text(ocr_text)
+                if v2:
+                    fields["vendor"] = v2
+                    conf["vendor"] = 0.55
 
-        # final validation: tight checks
-        if "amount" in kv:
+        # 3) validation rules & sanity checks
+        # amount boundary checks
+        if "amount" in fields:
             try:
-                if not (1 <= float(kv["amount"]) <= 10_000_000):
-                    del kv["amount"]
-                    confidence.pop("amount", None)
-            except:
-                kv.pop("amount", None)
-                confidence.pop("amount", None)
+                a = float(fields["amount"])
+                if not (1 <= a <= 10_000_000):
+                    issues.append("amount_out_of_range")
+                    del fields["amount"]
+                    conf.pop("amount", None)
+            except Exception:
+                issues.append("amount_invalid")
+                fields.pop("amount", None)
+                conf.pop("amount", None)
 
-        # build output
+        # date sanity
+        if "date" in fields:
+            # simple ISO check length
+            if not isinstance(fields["date"], str) or len(fields["date"]) < 6:
+                issues.append("date_invalid")
+                fields.pop("date", None)
+                conf.pop("date", None)
+
+        # vendor sanity: too short / token garble
+        if "vendor" in fields:
+            vval = fields["vendor"]
+            if len(vval) < 4 or re.search(r'[^ -~]', vval):  # non-ascii garbage
+                issues.append("vendor_suspect")
+                # keep vendor but lower confidence
+                conf["vendor"] = min(conf.get("vendor", 0.5), 0.5)
+
+        # final confidence normalization (0.0 - 1.0)
+        for k in list(conf.keys()):
+            try:
+                conf[k] = float(max(0.0, min(1.0, conf[k])))
+            except:
+                conf[k] = 0.5
+
+        # produce final output
         out = {
-            "fields": kv,
-            "confidence": confidence,
-            "raw_text": text_blob
+            "doc_type": doc_type,
+            "fields": fields,
+            "confidence": conf,
+            "issues": issues,
+            "raw_texts": {
+                "layoutlm": layout_text,
+                "ocr": ocr_text
+            }
         }
         return out
