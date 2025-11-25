@@ -1,90 +1,71 @@
-# app.py
+# app.py  (UPGRADE)
 import streamlit as st
 from PIL import Image
 import io
 import json
 import pandas as pd
-import pymupdf  # PyMuPDF (correct import for Streamlit Cloud)
-
+import pymupdf
 from model import LayoutLMInferencer
+from extract_kv import KeyValueExtractor
 
 st.set_page_config(page_title="Automated Document Processor", layout="wide")
+st.title("📄 Automated Document Processing System (LayoutLMv3 + Heuristics)")
+st.write("Auto-extract invoices / POs / approvals (local-only, no cloud).")
 
-st.title("📄 Automated Document Processing System (LayoutLMv3 + Streamlit)")
-st.write("Upload a document (PDF or image). The system will automatically extract structured data.")
-
-# ------------------------------------------------------------------
-# Load LayoutLMv3 inferencer
-# ------------------------------------------------------------------
 @st.cache_resource
 def load_inferencer():
-    return LayoutLMInferencer(
-        model_name="microsoft/layoutlmv3-base",
-        device="cpu"
-    )
+    return LayoutLMInferencer(model_name="microsoft/layoutlmv3-base", device="cpu")
 
 inferencer = load_inferencer()
+kv_extractor = KeyValueExtractor(inferencer, image_preprocess=True)
 
-# ------------------------------------------------------------------
-# File Upload
-# ------------------------------------------------------------------
-uploaded = st.file_uploader("Upload PDF or Image", type=["pdf", "png", "jpg", "jpeg"])
+uploaded = st.file_uploader("Upload PDF or image", type=["pdf","png","jpg","jpeg"])
+# Example local test quick-run using the file you uploaded earlier:
+st.markdown("**Tip:** to test a local file in the environment use the path: `/mnt/data/approval_001_native.pdf`")
 
 if uploaded:
-    st.info("📥 File uploaded. Processing automatically...")
-
+    st.info("Processing file...")
     file_bytes = uploaded.read()
     filename = uploaded.name.lower()
 
-    # ------------------------------------------------------------------
-    # Convert input → PIL Image (1st page for PDF)
-    # ------------------------------------------------------------------
+    pages = []
     if filename.endswith(".pdf"):
         pdf = pymupdf.open(stream=file_bytes, filetype="pdf")
-        page = pdf.load_page(0)
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
-        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+        for p in range(pdf.page_count):
+            page = pdf.load_page(p)
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(2,2))
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            pages.append(img)
     else:
-        img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        pages.append(Image.open(io.BytesIO(file_bytes)).convert("RGB"))
 
-    st.subheader("📄 Document Preview")
-    st.image(img, use_column_width=True)
+    all_results = []
+    for i, img in enumerate(pages):
+        st.subheader(f"Page {i+1} preview")
+        st.image(img, use_column_width=True)
+        with st.spinner(f"Extracting page {i+1}..."):
+            res = kv_extractor.extract_from_image(img)
+        st.json(res["fields"])
+        all_results.append(res)
 
-    # ------------------------------------------------------------------
-    # AUTOMATIC LAYOUTLM INFERENCE
-    # ------------------------------------------------------------------
-    with st.spinner("🔍 Running LayoutLMv3 model…"):
-        results = inferencer.infer(img)
+    # Merge page-level fields (simple strategy: prefer first non-empty)
+    merged = {}
+    for r in all_results:
+        for k,v in r["fields"].items():
+            if k not in merged or not merged[k]:
+                merged[k] = v
 
-    # ------------------------------------------------------------------
-    # Convert results → dataframe
-    # ------------------------------------------------------------------
-    df = pd.DataFrame(results)
+    st.subheader("Merged structured output")
+    st.json(merged)
 
-    st.subheader("🔎 Extracted Tokens")
-    st.dataframe(df, use_container_width=True)
+    # show raw tokens table for inspection (first page)
+    st.subheader("Raw tokens (first page)")
+    tokens = inferencer.infer(pages[0])
+    df_tokens = pd.DataFrame(tokens)
+    st.dataframe(df_tokens)
 
-    # Editable version for manual correction
-    st.subheader("✏️ Editable Extraction (Optional)")
-    editable = st.data_editor(df)
+    # Export
+    st.download_button("Download JSON", json.dumps(merged, indent=2), file_name=f"{filename}_extracted.json")
+    st.download_button("Download CSV", pd.DataFrame([merged]).to_csv(index=False), file_name=f"{filename}_extracted.csv")
 
-    # ------------------------------------------------------------------
-    # Export section
-    # ------------------------------------------------------------------
-    st.subheader("📤 Export Results")
-
-    st.download_button(
-        "Download JSON",
-        editable.to_json(orient="records", indent=2),
-        file_name=f"{filename}_tokens.json",
-        mime="application/json"
-    )
-
-    st.download_button(
-        "Download CSV",
-        editable.to_csv(index=False),
-        file_name=f"{filename}_tokens.csv",
-        mime="text/csv"
-    )
-
-    st.success("🎉 Processing complete!")
+    st.success("Done.")
