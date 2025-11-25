@@ -8,4 +8,5 @@ opencv-python-headless
 numpy
 pandas
 sentencepiece
-fitz
+pymupdf
+
