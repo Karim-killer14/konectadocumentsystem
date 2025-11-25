@@ -3,7 +3,7 @@ from transformers import AutoProcessor, AutoModelForTokenClassification
 from PIL import Image
 import io
 
-class DocumentInferencer:
+class LayoutLMInferencer:
     def __init__(self, model_name="microsoft/layoutlmv3-base", device=None):
         """
         LayoutLMv3 inference wrapper
