@@ -35,7 +35,7 @@ if uploaded:
     # Convert uploaded file into a PIL image
     # --------------------------------------------------------------
     if filename.lower().endswith(".pdf"):
-        import fitz  # PyMuPDF
+        import pymupdf as fitz
         pdf = fitz.open(stream=raw, filetype="pdf")
         page = pdf.load_page(0)
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
