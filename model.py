@@ -48,36 +48,61 @@ class LayoutLMInferencer:
     # ----------------------------------------------------------------------
     # MAIN INFERENCE
     # ----------------------------------------------------------------------
-    def infer(self, uploaded_file, task="key_value"):
+    def infer(self, input_data, task="key_value"):
         """
-        Runs LayoutLMv3 inference on input document.
-        WARNING: LayoutLMv3 Base does token classification, NOT full form extraction.
+        Accepts either:
+        - PIL Image
+        - Uploaded file (pdf, jpg, png)
         """
-        image = self.load_image(uploaded_file)
-
-        # ❗ IMPORTANT:
-        # DO NOT supply boxes/words → LayoutLMv3 handles its own OCR
+        # If PIL Image is passed → use directly
+        if isinstance(input_data, Image.Image):
+            image = input_data
+        else:
+            image = self.load_image(input_data)
+    
+        # run LayoutLM processor (no boxes, no words)
         enc = self.processor(
             image,
             padding="max_length",
             return_tensors="pt"
         )
-
+    
         enc = {k: v.to(self.device) for k, v in enc.items()}
-
+    
         with torch.no_grad():
             outputs = self.model(**enc)
-
+    
         logits = outputs.logits
         predictions = torch.argmax(logits, dim=-1).squeeze().cpu().tolist()
-
+    
         tokens = self.processor.tokenizer.convert_ids_to_tokens(
             enc["input_ids"].squeeze()
         )
-
+    
         results = []
         for token, pred in zip(tokens, predictions):
             if token not in ["[PAD]", "[UNK]", "[CLS]", "[SEP]"]:
                 results.append({"token": token, "label_id": pred})
-
+    
         return results
+    
+    
+    def load_image(self, uploaded_file):
+        """
+        Support uploading PDFs or raw bytes.
+        """
+        if isinstance(uploaded_file, bytes):
+            file_bytes = uploaded_file
+        else:
+            file_bytes = uploaded_file.read()
+    
+        # PDF?
+        if hasattr(uploaded_file, "name") and uploaded_file.name.lower().endswith(".pdf"):
+            import pymupdf as fitz
+            pdf = fitz.open(stream=file_bytes, filetype="pdf")
+            page = pdf.load_page(0)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    
+        # Image?
+        return Image.open(io.BytesIO(file_bytes)).convert("RGB")
