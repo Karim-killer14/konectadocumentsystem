@@ -6,7 +6,7 @@ import json
 import pandas as pd
 import pymupdf
 from model import LayoutLMInferencer
-from kv_extractor_final import FinalKVExtractor
+from extract_kv import FinalKVExtractor
 from validator import validate_fields
 
 st.set_page_config(page_title="Automated Document Processor", layout="wide")
