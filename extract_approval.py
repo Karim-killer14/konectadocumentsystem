@@ -1,74 +1,44 @@
 # extract_approval.py
+
 import re
 
 class ApprovalExtractor:
-    """
-    Handles approval forms:
-    - Request ID
-    - Requested By
-    - Department
-    - Purpose
-    - Amount
-    """
-
-    def extract(self, ocr_text: str, tokens):
-        text = ocr_text.lower()
+    def extract(self, text: str):
         fields = {}
-        confidence = {}
+        conf = {}
         issues = []
 
         # --- Request ID ---
-        m = re.search(r"(request id|req id|id)[^\d]*(\d{3,})", text)
+        m = re.search(r"(APV[-\s]*\d+[-\s]*\d+)", text, re.I)
         if m:
-            fields["request_id"] = m.group(2)
-            confidence["request_id"] = 0.9
-        else:
-            fields["request_id"] = None
-            issues.append("missing_request_id")
+            fields["request_id"] = m.group(1)
+            conf["request_id"] = 0.9
 
-        # --- Requested By ---
-        requested = self._extract_requested_by(text)
-        fields["requested_by"] = requested
-        confidence["requested_by"] = 0.8 if requested else 0.4
+        # --- Requested by ---
+        m = re.search(r"requested by[:\s]+(.+)", text, re.I)
+        if m:
+            fields["requested_by"] = m.group(1).strip()
+            conf["requested_by"] = 0.8
 
         # --- Department ---
-        dept = self._extract_department(text)
-        fields["department"] = dept
-        confidence["department"] = 0.75 if dept else 0.3
-
-        # --- Purpose ---
-        purpose = self._extract_purpose(text)
-        fields["purpose"] = purpose
-        confidence["purpose"] = 0.7 if purpose else 0.3
+        m = re.search(r"department[:\s]+(.+)", text, re.I)
+        if m:
+            fields["department"] = m.group(1).strip()
+            conf["department"] = 0.75
 
         # --- Amount ---
-        amount = self._extract_amount(text)
-        fields["amount"] = amount
-        confidence["amount"] = 0.85 if amount else 0.3
+        m = re.search(r"amount[:\s]+([0-9\.,]+)", text, re.I)
+        if m:
+            try:
+                fields["amount"] = float(m.group(1).replace(",", ""))
+                conf["amount"] = 0.85
+            except:
+                pass
 
-        if not amount:
-            issues.append("missing_amount")
+        # --- Purpose ---
+        m = re.search(r"purpose[:\s]+(.+)", text, re.I)
+        if m:
+            fields["purpose"] = m.group(1).strip()
+            conf["purpose"] = 0.7
 
-        return fields, confidence, issues
-
-    # ---------------------------
-    # Helper Functions
-    # ---------------------------
-    def _extract_requested_by(self, text):
-        m = re.search(r"requested by[:\s]*([a-z\s]+)", text)
-        return m.group(1).title().strip() if m else None
-
-    def _extract_department(self, text):
-        m = re.search(r"department[:\s]*([a-z\s]+)", text)
-        return m.group(1).title().strip() if m else None
-
-    def _extract_purpose(self, text):
-        m = re.search(r"purpose[:\s]*([a-z\s]+)", text)
-        return m.group(1).title().strip() if m else None
-
-    def _extract_amount(self, text):
-        m = re.findall(r"\d[\d,\.]{2,}", text)
-        if not m:
-            return None
-        nums = [float(x.replace(",", "")) for x in m]
-        return max(nums)
+        return fields, conf, issues
