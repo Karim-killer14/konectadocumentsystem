@@ -1,81 +1,110 @@
 # kv_extractor_generic.py
-
 import pytesseract
+from normalize import clean_layout_tokens
 from doc_classifier import DocumentClassifier
 from extract_invoice import InvoiceExtractor
 from extract_po import POExtractor
 from extract_approval import ApprovalExtractor
 
 class KVExtractorGeneric:
+    """
+    Hybrid dispatcher:
+     - Gets clean OCR text via pytesseract (primary text input)
+     - Uses LayoutLM tokens ONLY for optional confidence boosts / debugging
+     - Classifies the document
+     - Routes to format-specific extractor
+     - Falls back to generic extraction when unknown
+    """
     def __init__(self, inferencer, preprocess=True, tesseract_allowed=True):
-        self.model = inferencer
+        self.inferencer = inferencer
         self.tesseract_allowed = tesseract_allowed
+        self.classifier = DocumentClassifier()
+        self.inv = InvoiceExtractor()
+        self.po = POExtractor()
+        self.appr = ApprovalExtractor()
 
-        # Light rule-based classifier
-        self.cls = DocumentClassifier()
-
-        # Format-specific extractors
-        self.inv_ex = InvoiceExtractor()
-        self.po_ex = POExtractor()
-        self.apv_ex = ApprovalExtractor()
-
-    # ------------------------------------------------------------
-    # MAIN PIPELINE
-    # ------------------------------------------------------------
-    def extract(self, image):
-
-        # --------------------------------------------------------
-        # 1. Real OCR text (clean, no Ġ, no <pad>)
-        # --------------------------------------------------------
+    def extract(self, pil_image):
+        # 1) OCR (Tesseract)
+        ocr_text = ""
         if self.tesseract_allowed:
-            ocr_text = pytesseract.image_to_string(image)
-        else:
-            # fallback: join tokens from LayoutLM (not recommended)
-            tokens = self.model.infer(image)
-            ocr_text = " ".join(t["token"] for t in tokens)
+            try:
+                ocr_text = pytesseract.image_to_string(pil_image)
+            except Exception:
+                ocr_text = ""
 
-        clean_text = self._clean_ocr_text(ocr_text)
+        # 2) Clean OCR text
+        clean_text = self._clean_text(ocr_text)
 
-        # --------------------------------------------------------
-        # 2. Classify document based on OCR text
-        # --------------------------------------------------------
-        doc_type = self.cls.classify(clean_text)
+        # 3) Get LayoutLM tokens (for diagnostics/confidence)
+        try:
+            tokens = self.inferencer.infer(pil_image)
+            token_text = " ".join(t.get("token", "") for t in tokens)
+            token_text = clean_layout_tokens(token_text)
+        except Exception:
+            tokens = []
+            token_text = ""
 
-        # --------------------------------------------------------
-        # 3. Format-specific extraction
-        # --------------------------------------------------------
+        # 4) Hybrid classification: prefer OCR-based classification
+        doc_type = self.classifier.classify(clean_text if clean_text else token_text)
+
+        # 5) Route to extractor
+        out = None
         if doc_type == "invoice":
-            fields, conf, issues = self.inv_ex.extract(clean_text)
-
+            out = self.inv.extract(clean_text, tokens)
         elif doc_type == "po":
-            fields, conf, issues = self.po_ex.extract(clean_text)
-
+            out = self.po.extract(clean_text, tokens)
         elif doc_type == "approval":
-            fields, conf, issues = self.apv_ex.extract(clean_text)
-
+            out = self.appr.extract(clean_text, tokens)
         else:
-            fields, conf, issues = {}, {}, ["unknown_document"]
+            # fallback generic extraction using OCR heuristics
+            out = self._generic_extract(clean_text, tokens)
 
-        # --------------------------------------------------------
-        # 4. Add model confidence (optional)
-        # --------------------------------------------------------
-        # LayoutLM not used for text extraction; we only take confidence boost
-        for k in fields:
-            if k not in conf:
-                conf[k] = 0.7  # reasonable default
-
-        return {
-            "doc_type": doc_type,
-            "fields": fields,
-            "confidence": conf,
-            "issues": issues
+        # 6) Ensure standard output shape (dict)
+        result = {
+            "doc_type": out.get("doc_type", doc_type if doc_type else "unknown"),
+            "fields": out.get("fields", {}),
+            "confidence": out.get("confidence", {}),
+            "issues": out.get("issues", []),
+            "raw": {
+                "ocr_text": clean_text,
+                "layout_text": token_text
+            }
         }
 
-    # --------------------------------------------------------
-    # OCR cleaner
-    # --------------------------------------------------------
-    def _clean_ocr_text(self, text: str):
-        text = text.replace("\x0c", "")  # remove form-feed
-        text = text.replace("\n\n", "\n")
-        text = " ".join(text.split())
-        return text
+        return result
+
+    def _clean_text(self, text: str):
+        if not text:
+            return ""
+        return " ".join(text.replace("\x0c", " ").split())
+
+    def _generic_extract(self, text, tokens):
+        # Very small fallback: try to grab amount/date/vendor heuristics
+        fields = {}
+        conf = {}
+        issues = []
+
+        import re
+        # amount: largest number in text
+        nums = re.findall(r"\d[\d,\.]+\d", text)
+        if nums:
+            try:
+                vals = [float(n.replace(",", "")) for n in nums]
+                fields["amount"] = max(vals)
+                conf["amount"] = 0.6
+            except:
+                pass
+
+        # date
+        m = re.search(r"\d{2}[\/\-]\d{2}[\/\-]\d{4}", text)
+        if m:
+            fields["date"] = m.group(0)
+            conf["date"] = 0.6
+
+        # vendor (first non-empty line)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            fields["vendor"] = lines[0]
+            conf["vendor"] = 0.5
+
+        return {"doc_type": "unknown", "fields": fields, "confidence": conf, "issues": issues}
