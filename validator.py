@@ -1,74 +1,53 @@
-# validator.py (final adaptive validator)
+# validator.py
 
 def validate_doc(document):
     """
-    Adaptive validation based on doc_type.
-    Only checks the required fields for that document class.
+    Adaptive validator per document type.
+    Input:
+      { "doc_type":..., "fields": {...}, "confidence": {...}, "issues": [...] }
+    Returns:
+      { "valid": bool, "field_results": {...}, "suggestions": [...] }
     """
 
     doc_type = document.get("doc_type", "unknown")
-    fields = document.get("fields", {})
-    confidence = document.get("confidence", {})
-    issues = document.get("issues", [])
+    fields = document.get("fields", {}) or {}
+    confidence = document.get("confidence", {}) or {}
+    issues = document.get("issues", []) or []
 
-    # -----------------------------------------
-    # REQUIRED FIELD SETS
-    # -----------------------------------------
     REQUIRED = {
-        "invoice": ["invoice_number", "vendor", "date", "amount", "currency"],
-        "po": ["po_number", "vendor", "date", "total", "currency", "department"],
+        "invoice": ["invoice_number", "vendor", "date", "total"],
+        "po": ["po_number", "vendor", "date", "total"],
         "approval": ["request_id", "requested_by", "department", "purpose", "amount"],
-        "unknown": []  # don't require anything
-    }
-
-    OPTIONAL = {
-        "approval": ["approver", "status"],
-        "invoice": ["line_items"],
-        "po": ["line_items"],
         "unknown": []
     }
 
-    required_fields = REQUIRED.get(doc_type, [])
-    optional_fields = OPTIONAL.get(doc_type, [])
+    OPTIONAL = {
+        "invoice": ["line_items"],
+        "po": ["delivery_date"],
+        "approval": ["approver", "status"],
+        "unknown": []
+    }
+
+    required = REQUIRED.get(doc_type, [])
+    optional = OPTIONAL.get(doc_type, [])
 
     field_results = {}
     suggestions = []
 
-    # -----------------------------------------
-    # Validate required fields
-    # -----------------------------------------
-    for field in required_fields:
-        if field not in fields or fields[field] in [None, "", []]:
-            field_results[field] = {
-                "ok": False,
-                "reason": "missing"
-            }
-            suggestions.append(f"Missing required field: {field}")
+    for f in required:
+        if f not in fields or fields.get(f) in [None, "", []]:
+            field_results[f] = {"ok": False, "reason": "missing"}
+            suggestions.append(f"Missing required field: {f}")
         else:
-            field_results[field] = {
-                "ok": True,
-                "reason": "",
-                "confidence": confidence.get(field, 0.5)
-            }
+            field_results[f] = {"ok": True, "reason": "", "confidence": confidence.get(f)}
 
-    # -----------------------------------------
-    # Optional fields: warn if missing
-    # -----------------------------------------
-    for field in optional_fields:
-        if field not in fields or not fields[field]:
-            suggestions.append(f"Optional field missing: {field}")
+    for f in optional:
+        if f not in fields or fields.get(f) in [None, "", []]:
+            suggestions.append(f"Optional field missing: {f}")
 
-    # -----------------------------------------
-    # Add internal extraction issues
-    # -----------------------------------------
-    for issue in issues:
-        suggestions.append(f"Issue detected: {issue}")
+    for it in issues:
+        suggestions.append(f"Issue detected: {it}")
 
-    # Document is valid only if all required fields are present
-    valid = all(v["ok"] for v in field_results.values())
+    valid = all(v.get("ok", False) for v in field_results.values()) if field_results else True
 
-    return {
-        "valid": valid,
-        "field_results": field_results,
-        "suggestions": suggestions
-    }
+    return {"valid": valid, "field_results": field_results, "suggestions": suggestions}
