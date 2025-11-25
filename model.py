@@ -8,7 +8,7 @@ class LayoutLMInferencer:
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Processor performs internal OCR, so no boxes should be given
+        # LayoutLMv3 OCR-enabled processor
         self.processor = AutoProcessor.from_pretrained(
             model_name,
             apply_ocr=True
@@ -19,67 +19,73 @@ class LayoutLMInferencer:
         self.model.eval()
 
     # ----------------------------------------------------------------------
-    # UNIVERSAL IMAGE/PDF LOADER (only definition)
+    # UNIVERSAL IMAGE/PDF LOADER
     # ----------------------------------------------------------------------
     def load_image(self, file_obj):
         """
-        Accepts:
+        Safely loads PIL image from:
         - Streamlit UploadedFile
-        - bytes
-        - PDF → returns first-page image
-        - PNG/JPG → returns PIL image
+        - raw bytes
+        - PDF (first page)
         """
 
-        # Streamlit UploadedFile
+        # CASE 1 — Streamlit UploadedFile
         if hasattr(file_obj, "read"):
             file_bytes = file_obj.read()
-            filename = file_obj.name
+            filename = file_obj.name.lower()
 
-        # Raw bytes
+        # CASE 2 — Bytes
         elif isinstance(file_obj, (bytes, bytearray)):
             file_bytes = file_obj
             filename = ""
 
         else:
-            raise ValueError("load_image() received unsupported input.")
+            raise ValueError("load_image(): unsupported input type.")
 
-        # PDF case
-        if filename.lower().endswith(".pdf"):
+        # If PDF
+        if filename.endswith(".pdf"):
             import pymupdf as fitz
             pdf = fitz.open(stream=file_bytes, filetype="pdf")
             page = pdf.load_page(0)
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            imgbytes = pix.tobytes("png")
-            return Image.open(io.BytesIO(imgbytes)).convert("RGB")
+            return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
-        # Image case
+        # Otherwise: PNG/JPG/etc
         return Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
     # ----------------------------------------------------------------------
     # MAIN INFERENCE
     # ----------------------------------------------------------------------
     def infer(self, input_data):
+        """
+        Accepts:
+        - PIL.Image.Image
+        - Streamlit UploadedFile
+        - bytes
+        """
 
-        # Already a PIL Image
+        # CASE 1 — Already a PIL Image
         if isinstance(input_data, Image.Image):
             image = input_data
 
-        # UploadedFile
+        # CASE 2 — UploadedFile
         elif hasattr(input_data, "read"):
             image = self.load_image(input_data)
 
-        # Raw bytes
+        # CASE 3 — Raw bytes
         elif isinstance(input_data, (bytes, bytearray)):
             image = self.load_image(input_data)
 
         else:
-            raise ValueError(f"Unsupported input type: {type(input_data)}")
+            raise ValueError(f"infer(): unsupported input type {type(input_data)}")
 
-        # Run LayoutLM (internal OCR)
+        # ---------------------------------------------------------
+        # FEED DIRECTLY TO LayoutLMv3 PROCESSOR (NO BOXES)
+        # ---------------------------------------------------------
         enc = self.processor(
             image,
-            padding="max_length",
-            return_tensors="pt"
+            return_tensors="pt",
+            padding="max_length"
         )
         enc = {k: v.to(self.device) for k, v in enc.items()}
 
@@ -88,13 +94,15 @@ class LayoutLMInferencer:
 
         logits = outputs.logits
         pred_ids = torch.argmax(logits, dim=-1).squeeze().cpu().tolist()
+
         tokens = self.processor.tokenizer.convert_ids_to_tokens(
             enc["input_ids"].squeeze()
         )
 
+        # Clean output
         results = []
-        for t, pid in zip(tokens, pred_ids):
-            if t not in ["[PAD]", "[CLS]", "[SEP]", "[UNK]"]:
-                results.append({"token": t, "label_id": pid})
+        for token, pred in zip(tokens, pred_ids):
+            if token not in ["[PAD]", "[CLS]", "[SEP]", "[UNK]"]:
+                results.append({"token": token, "label_id": pred})
 
         return results
