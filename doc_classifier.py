@@ -3,31 +3,30 @@ import re
 
 class DocumentClassifier:
     """
-    Hybrid classifier:
-    - Uses OCR text BEFORE LayoutLM (fast)
-    - Uses token patterns AFTER LayoutLM (more accurate)
+    Lightweight regex-based classifier.
+    Looks at extracted tokens or raw OCR text.
     """
 
-    KEYWORDS = {
-        "invoice": ["invoice", "inv#", "invoice no", "billed to", "bill to", "tax invoice"],
-        "po": ["purchase order", "po#", "p.o.", "supplier ref", "delivery date"],
-        "approval": ["approval", "approved", "request id", "requested by", "approver", "status"]
-    }
+    def classify(self, text: str) -> str:
+        text_low = text.lower()
 
-    def classify(self, ocr_text: str, tokens=None):
-        text = ocr_text.lower()
+        # ---- APPROVAL ----
+        if any(k in text_low for k in [
+            "approval", "request id", "requested by", "approver", "status"
+        ]):
+            return "approval"
 
-        # --- Pre-LayoutLM Quick Detection ---
-        for doc_type, kws in self.KEYWORDS.items():
-            if any(k in text for k in kws):
-                return doc_type
+        # ---- INVOICE ----
+        if any(k in text_low for k in [
+            "invoice", "inv-", "vat", "subtotal", "grand total", "bill to"
+        ]):
+            return "invoice"
 
-        # --- Token-Based Fallback ---
-        if tokens:
-            token_str = " ".join(t["token"].lower() for t in tokens)
+        # ---- PURCHASE ORDER ----
+        if any(k in text_low for k in [
+            "purchase order", "po-", "delivery date", "supplier"
+        ]):
+            return "po"
 
-            for doc_type, kws in self.KEYWORDS.items():
-                if any(k in token_str for k in kws):
-                    return doc_type
-
+        # ---- UNKNOWN ----
         return "unknown"
