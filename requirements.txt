@@ -1,12 +1,9 @@
 streamlit
 transformers
 torch
-pytesseract
-pdf2image
 pillow
-opencv-python-headless
-numpy
-pandas
-sentencepiece
 pymupdf
-
+pytesseract
+opencv-python-headless
+pandas
+python-dateutil
