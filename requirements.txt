@@ -1,1 +1,11 @@
+streamlit
+transformers
+torch
+pytesseract
+pdf2image
+pillow
+opencv-python-headless
+numpy
+pandas
+sentencepiece
 
